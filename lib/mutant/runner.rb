@@ -18,9 +18,7 @@ module Mutant
       run_driver(
         reporter,
         Parallel.async(mutation_test_config(env))
-      ).tap do |result|
-        reporter.report(result)
-      end
+      ).tap(&reporter.public_method(:report))
     end
     private_class_method :run_mutation_analysis
 
