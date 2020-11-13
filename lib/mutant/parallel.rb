@@ -37,7 +37,14 @@ module Mutant
     end
 
     def self.threads(config, worker)
-      Array.new(config.jobs) { config.thread.new(&worker.method(:call)) }
+      thread = config.thread
+      Array.new(config.jobs) do  |index|
+        thread.new do
+          worker.call
+        end.tap do |thread|
+          thread.name = "mutant-#{index}"
+        end
+      end
     end
     private_class_method :threads
 

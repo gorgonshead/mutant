@@ -8,7 +8,7 @@ module Mutant
 
       READ_SIZE = 4096
 
-      ATTRIBUTES = %i[block log_pipe result_pipe world].freeze
+      ATTRIBUTES = %i[block deadline log_pipe result_pipe world].freeze
 
       # Unsuccessful result as child exited nonzero
       class ChildError < Result
@@ -64,9 +64,12 @@ module Mutant
         #
         # @return [Result]
         def call
-          pid = start_child or return ForkError.new
+          @log_fragments = []
 
-          read_child_result(pid)
+          @pid = start_child or return ForkError.new
+
+          read_child_result
+          terminate_child
 
           @result
         end
@@ -85,30 +88,42 @@ module Mutant
         end
 
         # rubocop:disable Metrics/MethodLength
-        def read_child_result(pid)
+        def read_child_result
           result_fragments = []
-          log_fragments    = []
 
-          read_fragments(
-            log_pipe.parent    => log_fragments,
-            result_pipe.parent => result_fragments
-          )
+          targets =
+            {
+              log_pipe.parent    => @log_fragments,
+              result_pipe.parent => result_fragments
+            }
+
+          read_targets(targets)
+
+          unless targets.empty?
+            add_result(Result::Timeout.new(deadline.allowed_time))
+            world.process.kill('KILL', @pid)
+            return
+          end
 
           begin
             result = world.marshal.load(result_fragments.join)
           rescue ArgumentError => exception
             add_result(Result::Exception.new(exception))
           else
-            add_result(Result::Success.new(result, log_fragments.join))
+            add_result(Result::Success.new(result, @log_fragments.join))
           end
-        ensure
-          wait_child(pid, log_fragments)
         end
         # rubocop:enable Metrics/MethodLength
 
-        def read_fragments(targets)
+        def read_targets(targets)
           until targets.empty?
-            ready, = world.io.select(targets.keys)
+            status = deadline.status
+
+            break unless status.ok?
+
+            ready, = world.io.select(targets.keys, [], [], status.time_left)
+
+            break unless ready
 
             ready.each do |fd|
               if fd.eof?
@@ -120,12 +135,44 @@ module Mutant
           end
         end
 
-        def wait_child(pid, log_fragments)
-          _pid, status = world.process.wait2(pid)
+        def terminate_child
+          status = wait_child
 
-          unless status.success? # rubocop:disable Style/GuardClause
-            add_result(ChildError.new(status, log_fragments.join))
+          if status
+            handle_status(status)
+            return
+          else
+            world.process.kill('KILL', @pid)
           end
+
+          status = wait_child
+
+          if status
+            handle_status(status)
+            return
+          else
+            fail "Even after SIGKILL #@pid is alive, giving up"
+          end
+        end
+
+        def handle_status(status)
+          unless status.success? # rubocop:disable Style/GuardClause
+            add_result(ChildError.new(status, @log_fragments.join))
+          end
+        end
+
+        def wait_child
+          process = world.process
+          status = nil
+
+          # NOTE TO SELF make it wait according to deadline before giving up.
+          2.times do
+            _pid, status = world.process.wait2(@pid, Process::WNOHANG)
+            break if status
+            world.kernel.sleep(0.1)
+          end
+
+          status
         end
 
         def add_result(result)
@@ -162,12 +209,14 @@ module Mutant
       # ignore :reek:NestedIterators
       #
       # rubocop:disable Metrics/MethodLength
-      def call(&block)
+      def call(timeout, &block)
+        deadline = world.deadline(timeout)
         io = world.io
         Pipe.with(io) do |result|
           Pipe.with(io) do |log|
             Parent.call(
               block:       block,
+              deadline:    deadline,
               log_pipe:    log,
               result_pipe: result,
               world:       world
@@ -175,6 +224,7 @@ module Mutant
           end
         end
       end
+
       # rubocop:enable Metrics/MethodLength
     end # Fork
   end # Isolation

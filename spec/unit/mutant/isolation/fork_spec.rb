@@ -11,38 +11,25 @@
 RSpec.describe Mutant::Isolation::Fork do
   let(:block_return)      { instance_double(Object, :block_return)      }
   let(:block_return_blob) { instance_double(String, :block_return_blob) }
-  let(:io)                { class_double(IO)                            }
   let(:isolated_block)    { -> { block_return }                         }
   let(:log_fragment)      { 'log message'                               }
   let(:log_reader)        { instance_double(IO, :log_reader)            }
   let(:log_writer)        { instance_double(IO, :log_writer)            }
-  let(:marshal)           { class_double(Marshal)                       }
   let(:pid)               { class_double(Integer)                       }
-  let(:process)           { class_double(Process)                       }
   let(:result_fragment)   { 'result body'                               }
   let(:result_reader)     { instance_double(IO, :result_reader)         }
   let(:result_writer)     { instance_double(IO, :result_writer)         }
-  let(:stderr)            { instance_double(IO, :stderr)                }
-  let(:stdout)            { instance_double(IO, :stdout)                }
+  let(:timeout)           { nil                                         }
 
   let(:status_success) do
     instance_double(Process::Status, success?: true)
   end
 
-  let(:world) do
-    instance_double(
-      Mutant::World,
-      io:      io,
-      marshal: marshal,
-      process: process,
-      stderr:  stderr,
-      stdout:  stdout
-    )
-  end
+  let(:world) { fake_world }
 
   let(:fork_success) do
     {
-      receiver: process,
+      receiver: world.process,
       selector: :fork,
       reaction: {
         yields: [],
@@ -53,9 +40,9 @@ RSpec.describe Mutant::Isolation::Fork do
 
   let(:child_wait) do
     {
-      receiver:  process,
+      receiver:  world.process,
       selector:  :wait2,
-      arguments: [pid],
+      arguments: [pid, Process::WNOHANG],
       reaction:  {
         return: [pid, status_success]
       }
@@ -71,7 +58,7 @@ RSpec.describe Mutant::Isolation::Fork do
 
   let(:load_success) do
     {
-      receiver:  marshal,
+      receiver:  world.marshal,
       selector:  :load,
       arguments: [result_fragment],
       reaction:  {
@@ -83,10 +70,10 @@ RSpec.describe Mutant::Isolation::Fork do
   let(:read_fragments) do
     [
       {
-        receiver:  io,
+        receiver:  world.io,
         selector:  :select,
-        arguments: [[log_reader, result_reader]],
-        reaction:  { return: [[log_reader, result_reader], []] }
+        arguments: [[log_reader, result_reader], [], [], nil],
+        reaction:  { return: [[log_reader, result_reader], [], []] }
       },
       {
         receiver: log_reader,
@@ -111,10 +98,10 @@ RSpec.describe Mutant::Isolation::Fork do
         reaction:  { return: result_fragment }
       },
       {
-        receiver:  io,
+        receiver:  world.io,
         selector:  :select,
-        arguments: [[log_reader, result_reader]],
-        reaction:  { return: [[log_reader, result_reader], []] }
+        arguments: [[log_reader, result_reader], [], [], nil],
+        reaction:  { return: [[log_reader, result_reader], [], []] }
       },
       {
         receiver: log_reader,
@@ -131,7 +118,6 @@ RSpec.describe Mutant::Isolation::Fork do
 
   let(:killfork) do
     [
-      # Inside the killfork
       {
         receiver: log_reader,
         selector: :close
@@ -141,22 +127,20 @@ RSpec.describe Mutant::Isolation::Fork do
         selector: :close
       },
       {
-        receiver:  stderr,
+        receiver:  world.stderr,
         selector:  :reopen,
         arguments: [log_writer]
       },
       {
-        receiver:  stdout,
+        receiver:  world.stdout,
         selector:  :reopen,
         arguments: [log_writer]
       },
       {
-        receiver:  marshal,
+        receiver:  world.marshal,
         selector:  :dump,
         arguments: [block_return],
-        reaction:  {
-          return: block_return_blob
-        }
+        reaction:  { return: block_return_blob }
       },
       {
         receiver:  result_writer,
@@ -172,13 +156,13 @@ RSpec.describe Mutant::Isolation::Fork do
     subject { described_class.new(world) }
 
     def apply
-      subject.call(&isolated_block)
+      subject.call(timeout, &isolated_block)
     end
 
     let(:prefork_expectations) do
       [
         {
-          receiver:  io,
+          receiver:  world.io,
           selector:  :pipe,
           arguments: [binmode: true],
           reaction:  {
@@ -186,7 +170,7 @@ RSpec.describe Mutant::Isolation::Fork do
           }
         },
         {
-          receiver:  io,
+          receiver:  world.io,
           selector:  :pipe,
           arguments: [binmode: true],
           reaction:  {
@@ -196,7 +180,7 @@ RSpec.describe Mutant::Isolation::Fork do
       ]
     end
 
-    context 'when no IO operation fails' do
+    context 'happy paths without configured timeouts' do
       let(:expectations) do
         [
           *prefork_expectations,
@@ -216,6 +200,159 @@ RSpec.describe Mutant::Isolation::Fork do
       end
     end
 
+    def timer(now)
+      {
+        receiver: world.timer,
+        selector: :now,
+        reaction: { return: now }
+      }
+    end
+
+    context 'with configured timeouts' do
+      let(:timeout) { 4.0 }
+
+      let(:prefork_expectations) do
+        [timer(0.0), *super()]
+      end
+
+      context 'reads within timeout' do
+        let(:read_fragments) do
+          [
+            timer(1.0),
+            {
+              receiver:  world.io,
+              selector:  :select,
+              arguments: [[log_reader, result_reader], [], [], 3.0],
+              reaction:  { return: [[log_reader, result_reader], [], []] }
+            },
+            {
+              receiver: log_reader,
+              selector: :eof?,
+              reaction: { return: false }
+            },
+            {
+              receiver:  log_reader,
+              selector:  :read_nonblock,
+              arguments: [4096],
+              reaction:  { return: log_fragment }
+            },
+            {
+              receiver: result_reader,
+              selector: :eof?,
+              reaction: { return: false }
+            },
+            {
+              receiver:  result_reader,
+              selector:  :read_nonblock,
+              arguments: [4096],
+              reaction:  { return: result_fragment }
+            },
+            timer(2.0),
+            {
+              receiver:  world.io,
+              selector:  :select,
+              arguments: [[log_reader, result_reader], [], [], 2.0],
+              reaction:  { return: [[log_reader, result_reader], [], []] }
+            },
+            {
+              receiver: log_reader,
+              selector: :eof?,
+              reaction: { return: true }
+            },
+            {
+              receiver: result_reader,
+              selector: :eof?,
+              reaction: { return: true }
+            }
+          ]
+        end
+
+        let(:expectations) do
+          [
+            *prefork_expectations,
+            fork_success,
+            *killfork,
+            close(result_writer),
+            *read_fragments,
+            load_success,
+            child_wait
+          ].map { |attributes| XSpec::MessageExpectation.parse(**attributes) }
+        end
+
+        specify do
+          XSpec::ExpectationVerifier.verify(self, expectations) do
+            expect(apply).to eql(Mutant::Isolation::Result::Success.new(block_return, log_fragment))
+          end
+        end
+      end
+
+      context 'timeout from select' do
+        let(:read_fragments) do
+          [
+            timer(1.0),
+            {
+              receiver:  world.io,
+              selector:  :select,
+              arguments: [[log_reader, result_reader], [], [], 3.0],
+              reaction:  { return: nil }
+            }
+          ]
+        end
+
+        let(:expectations) do
+          [
+            *prefork_expectations,
+            fork_success,
+            *killfork,
+            close(result_writer),
+            *read_fragments,
+            {
+              receiver: world.process,
+              selector: :kill,
+              arguments: ['KILL', pid]
+            },
+            child_wait
+          ].map { |attributes| XSpec::MessageExpectation.parse(**attributes) }
+        end
+
+        specify do
+          XSpec::ExpectationVerifier.verify(self, expectations) do
+            expect(apply).to eql(Mutant::Isolation::Result::Timeout.new(timeout))
+          end
+        end
+      end
+
+      context 'timeout outside select' do
+        let(:read_fragments) do
+          [
+            timer(5.0)
+          ]
+        end
+
+        let(:expectations) do
+          [
+            *prefork_expectations,
+            fork_success,
+            *killfork,
+            close(result_writer),
+            *read_fragments,
+            {
+              receiver: world.process,
+              selector: :kill,
+              arguments: ['KILL', pid]
+            },
+            child_wait
+          ].map { |attributes| XSpec::MessageExpectation.parse(**attributes) }
+        end
+
+        specify do
+          XSpec::ExpectationVerifier.verify(self, expectations) do
+            expect(apply).to eql(Mutant::Isolation::Result::Timeout.new(timeout))
+          end
+        end
+      end
+    end
+
     context 'when expected exception was raised when loading result' do
       let(:exception) { ArgumentError.new }
 
@@ -227,7 +364,7 @@ RSpec.describe Mutant::Isolation::Fork do
           close(result_writer),
           *read_fragments,
           {
-            receiver:  marshal,
+            receiver:  world.marshal,
             selector:  :load,
             arguments: [result_fragment],
             reaction:  {
@@ -252,7 +389,7 @@ RSpec.describe Mutant::Isolation::Fork do
         [
           *prefork_expectations,
           {
-            receiver: process,
+            receiver: world.process,
             selector: :fork,
             reaction: {
               return: nil
@@ -289,9 +426,9 @@ RSpec.describe Mutant::Isolation::Fork do
           *read_fragments,
           load_success,
           {
-            receiver:  process,
+            receiver:  world.process,
             selector:  :wait2,
-            arguments: [pid],
+            arguments: [pid, Process::WNOHANG],
             reaction:  {
               return: [pid, status_error]
             }

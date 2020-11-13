@@ -3,6 +3,7 @@
 * Change CLI report format to print diff last.
   This should be more user friendly on incremental / interactive
   operation.
+* Add support for external mutation timeouts.
 
 # v0.10.6 2020-11-06
 

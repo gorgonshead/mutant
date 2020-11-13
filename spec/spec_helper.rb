@@ -34,7 +34,6 @@ module Fixtures
   TEST_ENV = Mutant::Bootstrap
     .apply(Mutant::WORLD, test_config)
     .from_right
-
 end # Fixtures
 
 module ParserHelper
@@ -62,10 +61,33 @@ module XSpecHelper
   def undefined
     double('undefined')
   end
+
+  def fake_world
+    Mutant::World.new(
+      condition_variable: class_double(ConditionVariable),
+      gem:                class_double(Gem),
+      gem_method:         instance_double(Proc),
+      io:                 class_double(IO),
+      json:               class_double(JSON),
+      kernel:             class_double(Kernel),
+      load_path:          instance_double(Array),
+      marshal:            class_double(Marshal),
+      mutex:              class_double(Mutex),
+      object_space:       class_double(ObjectSpace),
+      open3:              class_double(Open3),
+      pathname:           class_double(Pathname),
+      process:            class_double(Process),
+      stderr:             instance_double(IO),
+      stdout:             instance_double(IO),
+      thread:             class_double(Thread),
+      timer:              instance_double(Mutant::Timer),
+      warnings:           instance_double(Mutant::Warnings)
+    )
+  end
 end # XSpecHelper
 
 RSpec.configuration.around(file_path: %r{spec/unit}) do |example|
-  Timeout.timeout(2, &example)
+  Timeout.timeout(10, &example)
 end
 
 RSpec.shared_examples_for 'a command method' do
